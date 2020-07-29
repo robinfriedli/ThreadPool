@@ -1,0 +1,24 @@
+plugins {
+    id "java"
+}
+
+group "net.robinfriedli"
+version "1.0"
+sourceCompatibility = "8"
+targetCompatibility = "8"
+
+compileJava.options.encoding = "UTF-8"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testCompile "org.testng:testng:7.1.0"
+    testCompile "com.google.truth:truth:1.0.1"
+}
+
+
+test {
+    useTestNG()
+}
