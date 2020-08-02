@@ -15,10 +15,143 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
+ * Scalable self growing / shrinking ThreadPool implementation. This ThreadPool implements the {@link java.util.concurrent.ExecutorService}
+ * interface and offers an alternative for the {@link java.util.concurrent.ThreadPoolExecutor} implementation that
+ * prioritizes creating new worker threads above queueing tasks for better potential throughput and flexibility.
+ * <p>
+ * This ThreadPool has two different pool sizes; a core pool size filled with threads that live for as long as the pool
+ * and only exit once the pool is shut down and a max pool size which describes the maximum number of worker threads
+ * that may live at the same time. Those additional non-core threads have a specific keep-alive time specified when
+ * creating the ThreadPool that defines how long such threads may be idle for without receiving any work before giving
+ * up and terminating their work loop.
+ * <p>
+ * This ThreadPool does not spawn any threads until a task is submitted to it. Then it will create a new thread for each
+ * task until the core pool is full. After that a new thread will only be created upon an {@link #execute(Runnable)} call
+ * if the current pool size is lower than the max pool size and there are no idle threads.
+ * <p>
+ * This is one of the major differences in implementation compared to the {@link java.util.concurrent.ThreadPoolExecutor},
+ * which only creates a new worker thread if the pool size is below the core size or if submitting the task to the queue
+ * fails. So when using an unbounded work queue, that implementation never creates any additional threads above the core
+ * pool size since submitting a task to the queue never fails. This means that the max pool size is only meaningful when
+ * using a bounded or zero-capacity queue {@link java.util.concurrent.SynchronousQueue}. Both of these options have the
+ * disadvantage that the pool starts rejecting tasks if the max pool size has been reached.
+ * <p>
+ * So, in essence, {@link java.util.concurrent.ThreadPoolExecutor} offers 3 options, all of which are suboptimal:
+ * <p>
+ * 1: Using and unbounded queue; This option does not provide any flexibility as the pool will stay at the core pool size
+ * unless core pool thread timeout is enabled, essentially meaning there is no core pool at all. The max pool size is
+ * meaningless when choosing this option.
+ * <p>
+ * 2: Using a bounded queue; In this case additional non-core workers are created after the bounded queue is full. If
+ * the queue is full and the pool is at its maximum size the pool will start rejecting tasks.
+ * <p>
+ * 3: Using a zero-capacity {@link java.util.concurrent.SynchronousQueue}; With this option there technically is no queue.
+ * Queue submissions always fail if there is no idle thread polling the queue. So new worker threads are spawned whenever
+ * a task is submitted and there are no idle threads until the maximum size has been reached, which is when the pool
+ * starts rejecting tasks.
+ * <p>
+ * Essentially {@link java.util.concurrent.ThreadPoolExecutor} forces users to choose between {@link Executors#newFixedThreadPool(int)}
+ * and not have a flexible pool or use {@link Executors#newCachedThreadPool()} and deal with rejected executions if the
+ * pool reaches its maximum size because there is no queue.
+ * <p>
+ * This ThreadPool allows users to use an unbounded queue to store up to {@link Integer#MAX_VALUE} tasks while having a
+ * flexible pool that dynamically creates new worker threads if there are no idle threads.
+ * <p>
+ * Since this ThreadPool implements the {@link java.util.concurrent.ExecutorService} interface it offers the same methods
+ * to execute tasks. The {@link #execute(Runnable)} method simply submits a task for execution to the ThreadPool.
+ * {@link #submit(java.util.concurrent.Callable)} can be used to await the result of running the provided callable.
+ * <p>
+ * When creating a new worker this ThreadPool always re-checks whether the new worker is still required before spawning
+ * a thread and passing it the submitted task in case an idle thread has opened up in the meantime or another thread has
+ * already created the worker. If the re-check failed for a core worker the pool will try creating a new non-core worker
+ * before deciding no new worker is needed. Worker threads that throw an exception while executing their task will get
+ * revived immediately.
+ * <p>
+ * Locks are only used for the {@link #join()} and {@link #awaitTermination()} functionalities to obtain the monitor for
+ * the respective {@link Condition}. Workers are stored in a {@link ConcurrentHashMap} and all bookkeeping is based on
+ * atomic operations. This ThreadPool decides whether it is currently idle (and should fast-return join attempts) by
+ * comparing the total worker count to the idle worker count, which are two 32 bit numbers stored in a single {@link AtomicLong}
+ * making sure that if both should be updated they may be updated in a single atomic operation.
+ * <p>
+ * Usage:
+ * <p>
+ * Create a new ThreadPool:
  *
+ * <pre>{@code
+ * // create a ThreadPool with the default configuration based on the number of CPUs
+ * ThreadPool pool = new ThreadPool();
+ * // create a ThreadPool with a 5 core and 50 max pool size and a 60 second keep alive time for non-core workers
+ * ThreadPool pool = new ThreadPool(5, 50, 60, TimeUnit.SECONDS);
+ * // using the builder pattern
+ * ThreadPool pool = ThreadPool.Builder.create().setCoreSize(5).setMaxSize(50).build();
+ * }</pre>
+ * <p>
+ * Submit a task for execution by the ThreadPool:
+ *
+ * <pre>{@code
+ * ThreadPool pool = new ThreadPool();
+ * pool.execute(() -> {
+ *     try {
+ *         Thread.sleep(5000);
+ *     } catch (InterruptedException e) {
+ *         throw new RuntimeException(e);
+ *     }
+ *     System.out.println("hello");
+ * });
+ * }</pre>
+ * <p>
+ * Submit a task and await the result:
+ *
+ * <pre>{@code
+ * ThreadPool pool = new ThreadPool();
+ * Future<Integer> future = pool.submit(() -> {
+ *     try {
+ *         Thread.sleep(5000);
+ *     } catch (InterruptedException e) {
+ *         throw new RuntimeException(e);
+ *     }
+ *     return 4;
+ * });
+ * int result = future.get();
+ * }</pre>
+ * <p>
+ * Join and shut down the ThreadPool:
+ * <pre>{@code
+ * ThreadPool pool = new ThreadPool();
+ * for (int i = 0; i < 10; i++) {
+ *     pool.execute(() -> {
+ *         try {
+ *             Thread.sleep(10000);
+ *         } catch (InterruptedException e) {
+ *             throw new RuntimeException(e);
+ *         }
+ *     });
+ * }
+ * // wait for all threads to become idle, i.e. all tasks to be completed including tasks added by other threads after
+ * // join() is called by this thread, or for the timeout to be reached
+ * pool.join(5, TimeUnit.SECONDS);
+ *
+ * AtomicInteger counter = new AtomicInteger(0);
+ * for (int i = 0; i < 15; i++) {
+ *     pool.execute(() -> {
+ *         try {
+ *             Thread.sleep(10000);
+ *         } catch (InterruptedException e) {
+ *             throw new RuntimeException(e);
+ *         }
+ *
+ *         counter.incrementAndGet();
+ *     });
+ * }
+ *
+ * pool.shutdown();
+ * pool.awaitTermination();
+ * assertEquals(counter.get(), 15);
+ * }</pre>
  */
 public class ThreadPool extends AbstractExecutorService {
 
+    // dummy value for the workers key set
     private static final Object DUMMY = new Object();
 
     private final int coreSize;
@@ -38,26 +171,115 @@ public class ThreadPool extends AbstractExecutorService {
     private volatile boolean shutdown;
     private volatile boolean interrupt;
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * coreSize = number of CPUs (from the perspective of the OS, counting each core / hyper thread)
+     * <p>
+     * maxSize = coreSize * 4 (or coreSize * 2 or equal to coreSize if operation causes overflow)
+     * <p>
+     * keepAliveTime = 60
+     * <p>
+     * keepAliveUnit = {@link TimeUnit#SECONDS}
+     * <p>
+     * workQueue = new unbounded {@link LinkedBlockingQueue}
+     * <p>
+     * threadFactory = {@link Executors#defaultThreadFactory()}
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     */
     public ThreadPool() {
         this(getNumCpus());
     }
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * maxSize = coreSize * 4 (or coreSize * 2 or equal to coreSize if operation causes overflow)
+     * <p>
+     * keepAliveTime = 60
+     * <p>
+     * keepAliveUnit = {@link TimeUnit#SECONDS}
+     * <p>
+     * workQueue = new unbounded {@link LinkedBlockingQueue}
+     * <p>
+     * threadFactory = {@link Executors#defaultThreadFactory()}
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     *
+     * @param coreSize the number of core threads that stay alive for as long as this ThreadPool
+     */
     public ThreadPool(int coreSize) {
         this(coreSize, Math.max(coreSize * 4, Math.max(coreSize * 2, coreSize)), 60, TimeUnit.SECONDS);
     }
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * keepAliveTime = 60
+     * <p>
+     * keepAliveUnit = {@link TimeUnit#SECONDS}
+     * <p>
+     * workQueue = new unbounded {@link LinkedBlockingQueue}
+     * <p>
+     * threadFactory = {@link Executors#defaultThreadFactory()}
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     *
+     * @param coreSize the number of core threads that stay alive for as long as this ThreadPool
+     * @param maxSize  the maximum number of threads this pool can hold
+     */
     public ThreadPool(int coreSize, int maxSize) {
         this(coreSize, maxSize, 60, TimeUnit.SECONDS);
     }
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * workQueue = new unbounded {@link LinkedBlockingQueue}
+     * <p>
+     * threadFactory = {@link Executors#defaultThreadFactory()}
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     *
+     * @param coreSize      the number of core threads that stay alive for as long as this ThreadPool
+     * @param maxSize       the maximum number of threads this pool can hold
+     * @param keepAliveTime the amount of time worker threads outside of the core pool stay alive while waiting for work
+     * @param keepAliveUnit the time unit for the keepAliveTime
+     */
     public ThreadPool(int coreSize, int maxSize, long keepAliveTime, TimeUnit keepAliveUnit) {
         this(coreSize, maxSize, keepAliveTime, keepAliveUnit, new LinkedBlockingQueue<>());
     }
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * threadFactory = {@link Executors#defaultThreadFactory()}
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     *
+     * @param coreSize      the number of core threads that stay alive for as long as this ThreadPool
+     * @param maxSize       the maximum number of threads this pool can hold
+     * @param keepAliveTime the amount of time worker threads outside of the core pool stay alive while waiting for work
+     * @param keepAliveUnit the time unit for the keepAliveTime
+     * @param workQueue     the queue used to queue tasks if the pool is busy, an unbounded {@link LinkedBlockingQueue} by default
+     */
     public ThreadPool(int coreSize, int maxSize, long keepAliveTime, TimeUnit keepAliveUnit, BlockingQueue<Runnable> workQueue) {
         this(coreSize, maxSize, keepAliveTime, keepAliveUnit, workQueue, Executors.defaultThreadFactory());
     }
 
+    /**
+     * Overloading constructor with the following default values:
+     * <p>
+     * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+     *
+     * @param coreSize      the number of core threads that stay alive for as long as this ThreadPool
+     * @param maxSize       the maximum number of threads this pool can hold
+     * @param keepAliveTime the amount of time worker threads outside of the core pool stay alive while waiting for work
+     * @param keepAliveUnit the time unit for the keepAliveTime
+     * @param workQueue     the queue used to queue tasks if the pool is busy, an unbounded {@link LinkedBlockingQueue} by default
+     * @param threadFactory the factory used to create new worker threads
+     */
     public ThreadPool(
         int coreSize,
         int maxSize,
@@ -69,6 +291,18 @@ public class ThreadPool extends AbstractExecutorService {
         this(coreSize, maxSize, keepAliveTime, keepAliveUnit, workQueue, threadFactory, RejectedExecutionHandler.ABORT_POLICY);
     }
 
+    /**
+     * Construct a new ThreadPool. This action does not yet spawn any threads but initializes an empty ThreadPool.
+     *
+     * @param coreSize                 the number of core threads that stay alive for as long as this ThreadPool
+     * @param maxSize                  the maximum number of threads this pool can hold
+     * @param keepAliveTime            the amount of time worker threads outside of the core pool stay alive while waiting for work
+     * @param keepAliveUnit            the time unit for the keepAliveTime
+     * @param workQueue                the queue used to queue tasks if the pool is busy, an unbounded {@link LinkedBlockingQueue} by default
+     * @param threadFactory            the factory used to create new worker threads
+     * @param rejectedExecutionHandler the {@link RejectedExecutionHandler} used if the pool rejects tasks due to the queue
+     *                                 being full and the pool being busy
+     */
     public ThreadPool(
         int coreSize,
         int maxSize,
@@ -97,12 +331,34 @@ public class ThreadPool extends AbstractExecutorService {
 
     // executor methods
 
+    /**
+     * Initiates a soft shutdown in which all currently running and all queued tasks will finish execution but no new
+     * tasks will be accepted.
+     * <p>
+     * This interrupts all idle workers to inform them about the status change. After this point workers will no longer
+     * block while waiting for tasks from the queue but simply poll the queue once and exit upon receiving <code>null</code>.
+     * <p>
+     * Threads that are currently waiting for termination (see {@link #awaitTermination()}) will be notified by this
+     * method call if the pool is already empty. Else those threads are notified once the last worker exits.
+     */
     @Override
     public void shutdown() {
         shutdown = true;
         handleWorkerTermination(true);
     }
 
+    /**
+     * Initiates a hard shutdown in which all currently running tasks are interrupted (i.e. receive an interrupt signal,
+     * causing the task to throw an InterruptedException when performing a blocking operation, if the task does not
+     * check the interrupt flag it is unaffected) and all queued tasks are discarded.
+     * <p>
+     * This interrupts all workers and causes them to break their work loop without executing any further tasks. In case
+     * a race occurs where this method is called just after a worker is created but before it can start its initial task
+     * (or after a worker receives a task from the queue but before starting that task, though less likely due to lower
+     * time delta); the worker thread interrupts itself before starting its current task.
+     *
+     * @return all tasks that were in the queue when this method was called and never had the chance to run
+     */
     @Override
     public List<Runnable> shutdownNow() {
         shutdown = true;
@@ -120,16 +376,37 @@ public class ThreadPool extends AbstractExecutorService {
         return drain;
     }
 
+    /**
+     * @return true if this ThreadPool has been or is in the process of shutting down (i.e. if {@link #shutdown()} or
+     * {@link #shutdownNow()} has been called)
+     */
     @Override
     public boolean isShutdown() {
         return shutdown;
     }
 
+    /**
+     * @return true if this ThreadPool has been shutdown and all its workers have died (i.e. if {@link #shutdown()} or
+     * {@link #shutdownNow()} has been called and all workers have exited)
+     */
     @Override
     public boolean isTerminated() {
         return shutdown && workers.isEmpty();
     }
 
+    /**
+     * Await the termination of this ThreadPool. This blocks the current thread until {@link #shutdown()} or {@link #shutdownNow()}
+     * has been called and all workers have died. After calling this method {@link #isTerminated()} is guaranteed to return
+     * <code>true</code>. Additionally, this method returns once the provided timeout has been reached, returning
+     * <code>false</code>. This is always the case if this pool is not already shutting down and no other thread shuts down
+     * this ThreadPool during this time.
+     *
+     * @param timeout the maximum amount of time to wait for the termination of the ThreadPool
+     * @param unit    the time unit of timeout
+     * @return <code>true</code> if the pool has been shut down or <code>false</code> if the timeout has been reached
+     * before that happened
+     * @throws InterruptedException if the current thread is interrupted while waiting
+     */
     @Override
     public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
         if (unit == null) {
@@ -138,10 +415,41 @@ public class ThreadPool extends AbstractExecutorService {
         return doAwaitTermination(timeout, unit);
     }
 
-    public boolean awaitTermination() throws InterruptedException {
-        return doAwaitTermination(null, null);
+    /**
+     * Await the termination of this ThreadPool. This blocks the current thread until {@link #shutdown()} or {@link #shutdownNow()}
+     * has been called and all workers have died. After calling this method {@link #isTerminated()} is guaranteed to return
+     * <code>true</code>. Note that if the pool is not already shutting down and no other thread ever signals the
+     * ThreadPool to shut down this thread will be stuck waiting for ever.
+     *
+     * @throws InterruptedException if the current thread is interrupted while waiting
+     */
+    public void awaitTermination() throws InterruptedException {
+        doAwaitTermination(null, null);
     }
 
+    /**
+     * Join all tasks in this ThreadPool. This blocks the current thread until all tasks in this ThreadPool have been
+     * completed, including tasks submitted by other threads after this method has been called. Essentially this waits
+     * for the next time the pool to become idle, meaning all worker threads are idle and the queue is empty. Additionally,
+     * this method returns once the provided timeout has been reached, returning <code>false</code>.
+     * <p>
+     * This thread is notified once a worker completes a task and notices that it is the last thread to become idle and
+     * there is no work in the queue. If the pool is idle when calling this method, meaning all workers are idle
+     * and the queue is empty, the method will return immediately without blocking.
+     * <p>
+     * If a race occurs where the last worker to complete a task does not notify joiners because there is still work in
+     * the queue but none of that work is ever executed because {@link #shutdownNow()} is called immediately after; this
+     * thread will get notified once the last worker dies along with threads waiting for {@link #awaitTermination()}.
+     * This race condition is quite rare in pools with more than one thread because there has to be a point in time
+     * where all threads are idle when the last worker becomes idle while there is still work in the queue. Even with 1
+     * thread the time delta between the thread executing its previous task and starting to execute the next one is
+     * small enough for this to rarely occur in practice.
+     *
+     * @param timeout the maximum amount of time to wait for the pool to become idle
+     * @param unit    the time unit of timeout
+     * @return <code>true</code> if the join was successful, <code>false</code> if the timeout was reached
+     * @throws InterruptedException if the current thread is interrupted while waiting
+     */
     public boolean join(long timeout, TimeUnit unit) throws InterruptedException {
         if (unit == null) {
             throw new NullPointerException();
@@ -149,10 +457,39 @@ public class ThreadPool extends AbstractExecutorService {
         return doJoin(timeout, unit);
     }
 
+    /**
+     * Join all tasks in this ThreadPool. This blocks the current thread until all tasks in this ThreadPool have been
+     * completed, including tasks submitted by other threads after this method has been called. Essentially this waits
+     * for the next time the pool to become idle, meaning all worker threads are idle and the queue is empty.
+     * <p>
+     * This thread is notified once a worker completes a task and notices that it is the last thread to become idle and
+     * there is no work in the queue. If the pool is idle when calling this method, meaning all workers are idle
+     * and the queue is empty, the method will return immediately without blocking.
+     * <p>
+     * If a race occurs where the last worker to complete a task does not notify joiners because there is still work in
+     * the queue but none of that work is ever executed because {@link #shutdownNow()} is called immediately after; this
+     * thread will get notified once the last worker dies along with threads waiting for {@link #awaitTermination()}.
+     * This race condition is quite rare in pools with more than one thread because there has to be a point in time
+     * where all threads are idle when the last worker becomes idle while there is still work in the queue. Even with 1
+     * thread the time delta between the thread executing its previous task and starting to execute the next one is
+     * small enough for this to rarely occur in practice.
+     *
+     * @throws InterruptedException if the current thread is interrupted while waiting
+     */
     public void join() throws InterruptedException {
         doJoin(null, null);
     }
 
+    /**
+     * Submit a task for execution. If called after the pool has been shutdown by {@link #shutdown()} or {@link #shutdownNow()}
+     * the {@link RejectedExecutionHandler} specified when initializing the pool is called immediately. This method might
+     * spawn a new worker thread if the current pool size is lower than the core pool size or the current pool size is lower
+     * than the maximum pool size and there are no idle threads. Else the submitted task is offered to the workQueue, if
+     * that fails because the queue rejects the task (e.g. when using a bounded queue and the queue is full) the
+     * {@link RejectedExecutionHandler} is called.
+     *
+     * @param command the runnable to run
+     */
     @Override
     public void execute(Runnable command) {
         if (command == null) {
@@ -186,6 +523,21 @@ public class ThreadPool extends AbstractExecutorService {
         }
     }
 
+    /**
+     * @return a human readable string describing this ThreadPool including the following stats:
+     * <p>
+     * shut down: whether or not the pool has been (or is in the process of) shut down by {@link #shutdown()} or {@link #shutdownNow()}
+     * <p>
+     * interrupted: whether or not the pool has been interrupted (i.e. whether or not {@link #shutdownNow()} has been called)
+     * <p>
+     * terminated: whether or not the pool has been shut down and all workers have died (see {@link #isTerminated()})
+     * <p>
+     * idle workers: number of worker threads that are idle and waiting for work
+     * <p>
+     * total workers: total number of worker threads in this pool
+     * <p>
+     * queue size: number of tasks in the queue
+     */
     @Override
     public String toString() {
         WorkerCountPair workerData = workerCountData.getBoth();
@@ -201,38 +553,65 @@ public class ThreadPool extends AbstractExecutorService {
 
     // getters
 
+    /**
+     * @return the core pool size limit (i.e. number of threads that stay alive for as long as the pool)
+     */
     public int getCoreSize() {
         return coreSize;
     }
 
+    /**
+     * @return the maximum pool size of this ThreadPool
+     */
     public int getMaxSize() {
         return maxSize;
     }
 
+    /**
+     * @return the amount of time non-core workers stay alive while idly waiting for work
+     */
     public long getKeepAliveTime() {
         return keepAliveTime;
     }
 
+    /**
+     * @return the time unit for {@link #getKeepAliveTime()}
+     */
     public TimeUnit getKeepAliveUnit() {
         return keepAliveUnit;
     }
 
+    /**
+     * @return the work queue used to queue tasks when the pool is busy
+     */
     public BlockingQueue<Runnable> getWorkQueue() {
         return workQueue;
     }
 
+    /**
+     * @return the {@link ThreadFactory} used to create new worker threads
+     */
     public ThreadFactory getThreadFactory() {
         return threadFactory;
     }
 
+    /**
+     * @return the {@link RejectedExecutionHandler} used when the pool rejects tasks when the queue is full
+     */
     public RejectedExecutionHandler getRejectedExecutionHandler() {
         return rejectedExecutionHandler;
     }
 
+    /**
+     * @return the amount of worker threads currently alive in this pool, whether idle or not
+     */
     public int getCurrentWorkerCount() {
         return workerCountData.getTotalWorkerCount();
     }
 
+    /**
+     * @return the amount of worker threads in this pool that are currently idle and waiting for work
+     */
     public int getIdleWorkerCount() {
         return workerCountData.getIdleWorkerCount();
     }
@@ -255,6 +634,18 @@ public class ThreadPool extends AbstractExecutorService {
         return Runtime.getRuntime().availableProcessors();
     }
 
+    /**
+     * Create a new worker thread. This atomically increments the total worker count of the worker count data and uses
+     * the previous value to determine whether the new worker is still needed. If trying to create a core worker and noticing
+     * the core pool is already full (i.e. the previous worker total is already equal to the core size limit) this method
+     * attempts to create a non-core worker instead. If the max pool size has already been reached (i.e. the previous total
+     * is already equal to the max pool size limit) this method returns false, causing the task to be submitted to the
+     * queue instead.
+     *
+     * @param core whether or not the create worker should be a core thread
+     * @param task the initial task for the new worker to execute
+     * @return whether or not a new worker has actually been created
+     */
     private boolean createWorker(boolean core, Runnable task) {
         WorkerCountPair prevWorkerCountData = workerCountData.incrementWorkerTotalRetBoth();
         // recheck that the worker is still required or if another thread has already created one
@@ -326,6 +717,10 @@ public class ThreadPool extends AbstractExecutorService {
         }
     }
 
+    /**
+     * Builder for the ThreadPool to easily specify a custom configuration while leaving undefined values to the default
+     * configuration.
+     */
     public static class Builder {
 
         private Integer coreSize;
@@ -336,69 +731,154 @@ public class ThreadPool extends AbstractExecutorService {
         private ThreadFactory threadFactory;
         private RejectedExecutionHandler rejectedExecutionHandler;
 
+        /**
+         * @return a new Builder
+         */
         public static Builder create() {
             return new Builder();
         }
 
+        /**
+         * @return the core size specified for this builder
+         */
         public Integer getCoreSize() {
             return coreSize;
         }
 
+        /**
+         * Define the core pool size.
+         *
+         * @param coreSize the core pool size
+         * @return this builder for method chaining
+         */
         public Builder setCoreSize(Integer coreSize) {
             this.coreSize = coreSize;
             return this;
         }
 
+        /**
+         * @return the specified maximum pool size
+         */
         public Integer getMaxSize() {
             return maxSize;
         }
 
+        /**
+         * Define the maximum pool size.
+         *
+         * @param maxSize the max pool size
+         * @return this builder for method chaining
+         */
         public Builder setMaxSize(Integer maxSize) {
             this.maxSize = maxSize;
             return this;
         }
 
+        /**
+         * @return the specified keepAliveTime
+         */
         public Long getKeepAliveTime() {
             return keepAliveTime;
         }
 
+        /**
+         * @return the time unit used for {@link #getKeepAliveTime()}
+         */
         public TimeUnit getKeepAliveUnit() {
             return keepAliveUnit;
         }
 
+        /**
+         * Define the time and time unit to keep non-core worker threads alive when idle.
+         *
+         * @param keepAliveTime the time to keep non-core workers alive when idle
+         * @param keepAliveUnit the time unit for keepAliveTime
+         * @return this builder for method chaining
+         */
         public Builder setKeepAlive(Long keepAliveTime, TimeUnit keepAliveUnit) {
             this.keepAliveTime = keepAliveTime;
             this.keepAliveUnit = keepAliveUnit;
             return this;
         }
 
+        /**
+         * @return the specified workQueue
+         */
         public BlockingQueue<Runnable> getWorkQueue() {
             return workQueue;
         }
 
+        /**
+         * Define the workQueue used to queue tasks when the pool is busy.
+         *
+         * @param workQueue the workQueue
+         * @return this builder for method chaining
+         */
         public Builder setWorkQueue(BlockingQueue<Runnable> workQueue) {
             this.workQueue = workQueue;
             return this;
         }
 
+        /**
+         * @return the specified {@link ThreadFactory}
+         */
         public ThreadFactory getThreadFactory() {
             return threadFactory;
         }
 
+        /**
+         * Define the {@link ThreadFactory} used to create new worker threads.
+         *
+         * @param threadFactory the threadFactory
+         * @return this builder for method chaining
+         */
         public Builder setThreadFactory(ThreadFactory threadFactory) {
             this.threadFactory = threadFactory;
             return this;
         }
 
+        /**
+         * @return the specified {@link RejectedExecutionHandler}
+         */
         public RejectedExecutionHandler getRejectedExecutionHandler() {
             return rejectedExecutionHandler;
         }
 
+        /**
+         * Define the {@link RejectedExecutionHandler} called by the pool when submitting a task while the pool is busy
+         * and the queue is full.
+         *
+         * @param rejectedExecutionHandler the {@link RejectedExecutionHandler}
+         * @return this builder for method chaining
+         */
         public Builder setRejectedExecutionHandler(RejectedExecutionHandler rejectedExecutionHandler) {
             this.rejectedExecutionHandler = rejectedExecutionHandler;
             return this;
         }
 
+        /**
+         * Use the information previously given to this builder to build a ThreadPool instance with the following default
+         * values:
+         * <p>
+         * coreSize = number of CPUs (from the perspective of the OS, counting each core / hyper thread)
+         * <p>
+         * maxSize = coreSize * 4 (or coreSize * 2 or equal to coreSize if operation causes overflow)
+         * <p>
+         * keepAliveTime = 60
+         * <p>
+         * keepAliveUnit = {@link TimeUnit#SECONDS}
+         * <p>
+         * workQueue = new unbounded {@link LinkedBlockingQueue}
+         * <p>
+         * threadFactory = {@link Executors#defaultThreadFactory()}
+         * <p>
+         * rejectedExecutionHandler = {@link RejectedExecutionHandler#ABORT_POLICY}
+         * <p>
+         * If the coreSize is not defined but the maxSize is this makes sure that the coreSize is lower or equal to the
+         * maxSize.
+         *
+         * @return the created ThreadPool
+         */
         public ThreadPool build() {
             int coreSize = reqNonNullElse(this.coreSize, () -> {
                 int numCpus = getNumCpus();
@@ -587,6 +1067,10 @@ public class ThreadPool extends AbstractExecutorService {
 
     }
 
+    /**
+     * Helper class that manages an {@link AtomicLong} that holds two 32 bit numbers. The upper 32 bits store the total
+     * worker count and the lower 32 bits store the idle worker count.
+     */
     static final class WorkerCountData {
 
         private static final long WORKER_IDLE_MASK = 0x0000_0000_FFFF_FFFF;
