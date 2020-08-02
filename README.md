@@ -1,5 +1,7 @@
 # ThreadPool
 
+This repo is a Java port of the corresponding [Rust implementation](https://github.com/robinfriedli/rusty_pool)
+
 Scalable self growing / shrinking ThreadPool implementation. This ThreadPool implements the ExecutorService
 interface and offers an alternative for the JDK ThreadPoolExecutor implementation that prioritizes creating new worker
 threads above queueing tasks for better potential throughput and flexibility.
