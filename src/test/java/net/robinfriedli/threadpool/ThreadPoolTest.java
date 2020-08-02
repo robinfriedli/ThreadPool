@@ -7,6 +7,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -118,7 +119,7 @@ public class ThreadPoolTest {
             count.incrementAndGet();
         });
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(count.get(), 2);
     }
 
@@ -136,7 +137,7 @@ public class ThreadPoolTest {
             counter.incrementAndGet();
         });
 
-        pool.awaitTermination(5, TimeUnit.SECONDS);
+        pool.join(5, TimeUnit.SECONDS);
         assertEquals(counter.get(), 0);
     }
 
@@ -157,7 +158,7 @@ public class ThreadPoolTest {
             });
         }
 
-        pool.awaitTermination(2, TimeUnit.SECONDS);
+        pool.join(2, TimeUnit.SECONDS);
         pool.shutdown();
 
         Thread.sleep(5000);
@@ -178,7 +179,7 @@ public class ThreadPoolTest {
     public void testEmptyJoin() throws InterruptedException {
         ThreadPool pool = new ThreadPool(3, 10, 10, TimeUnit.SECONDS);
         // test that the join doesn't last forever but fast-returns if the pool is idle
-        pool.awaitTermination();
+        pool.join();
     }
 
     @Test
@@ -194,7 +195,7 @@ public class ThreadPoolTest {
         });
 
         Thread.sleep(5000);
-        pool.awaitTermination();
+        pool.join();
     }
 
     @Test
@@ -214,7 +215,7 @@ public class ThreadPoolTest {
         Thread.sleep(10000);
         assertEquals(pool.getCurrentWorkerCount(), 50);
 
-        pool.awaitTermination();
+        pool.join();
         Thread.sleep(15000);
         assertEquals(pool.getCurrentWorkerCount(), 5);
     }
@@ -237,7 +238,7 @@ public class ThreadPoolTest {
         // spawned and starts its first task
         Thread.sleep(1000);
         pool.shutdown();
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 1);
     }
 
@@ -256,9 +257,9 @@ public class ThreadPoolTest {
         });
 
         pool.shutdown();
-        pool.awaitTermination(5, TimeUnit.SECONDS);
+        pool.join(5, TimeUnit.SECONDS);
         assertEquals(counter.get(), 0);
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 1);
     }
 
@@ -266,8 +267,18 @@ public class ThreadPoolTest {
     public void testEmptyShutdownJoin() throws InterruptedException {
         ThreadPool pool = new ThreadPool(1, 5, 5, TimeUnit.SECONDS);
         pool.shutdown();
+        pool.join();
+        assertEquals(pool.getCurrentWorkerCount(), 0);
+        assertTrue(pool.isTerminated());
+    }
+
+    @Test
+    public void testEmptyShutdownAwait() throws InterruptedException {
+        ThreadPool pool = new ThreadPool(1, 5, 5, TimeUnit.SECONDS);
+        pool.shutdown();
         pool.awaitTermination();
         assertEquals(pool.getCurrentWorkerCount(), 0);
+        assertTrue(pool.isTerminated());
     }
 
     @Test
@@ -309,7 +320,7 @@ public class ThreadPoolTest {
             pool.execute(counter::incrementAndGet);
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 5);
         pool.shutdown();
         Thread.sleep(50);
@@ -349,6 +360,118 @@ public class ThreadPoolTest {
         Thread.sleep(7000);
         pool.shutdown();
         pool.awaitTermination();
+    }
+
+    @Test
+    public void testIsTerminated() throws InterruptedException {
+        ThreadPool pool = new ThreadPool();
+        AtomicBoolean interruptFlag = new AtomicBoolean(false);
+
+        pool.execute(() -> {
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException e) {
+                try {
+                    Thread.sleep(6000);
+                    interruptFlag.set(true);
+                } catch (InterruptedException e1) {
+                    throw new RuntimeException(e1);
+                }
+            }
+        });
+
+        pool.shutdownNow();
+        pool.awaitTermination();
+        assertTrue(pool.isTerminated());
+        assertTrue(interruptFlag.get());
+    }
+
+    @Test
+    public void testAwaitTerminationBeforeShutdown() throws InterruptedException {
+        ThreadPool pool = new ThreadPool();
+        AtomicInteger counter = new AtomicInteger(0);
+
+        for (int i = 0; i < 10000; i++) {
+            pool.execute(counter::incrementAndGet);
+        }
+
+        new Thread(() -> {
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            pool.shutdown();
+        }).start();
+
+        pool.awaitTermination();
+        assertEquals(counter.get(), 10000);
+    }
+
+    @Test
+    public void testExpireAwaitTermination() throws InterruptedException {
+        ThreadPool pool = new ThreadPool(1);
+        AtomicBoolean run = new AtomicBoolean(false);
+
+        pool.execute(() -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+
+            run.set(true);
+        });
+
+        pool.shutdown();
+        assertFalse(pool.awaitTermination(2, TimeUnit.SECONDS));
+        assertFalse(run.get());
+        pool.awaitTermination();
+        assertTrue(run.get());
+    }
+
+    @Test
+    public void testAwaitShutdownEmptyPool() throws InterruptedException {
+        ThreadPool pool = new ThreadPool(0, 3, 1, TimeUnit.SECONDS);
+        AtomicInteger counter = new AtomicInteger(0);
+
+        pool.execute(counter::incrementAndGet);
+
+        Thread.sleep(5000);
+        new Thread(() -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+
+            pool.shutdown();
+        }).start();
+        pool.awaitTermination();
+        assertTrue(pool.isShutdown());
+        assertTrue(pool.isTerminated());
+        assertEquals(counter.get(), 1);
+    }
+
+    @Test
+    public void testJoinShutdownEmptyPool() throws InterruptedException {
+        ThreadPool pool = new ThreadPool(0, 3, 1, TimeUnit.SECONDS);
+        AtomicInteger counter = new AtomicInteger(0);
+
+        pool.execute(counter::incrementAndGet);
+
+        Thread.sleep(5000);
+        new Thread(() -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+
+            pool.shutdown();
+        }).start();
+        pool.join();
+        assertEquals(counter.get(), 1);
     }
 
     @Test
@@ -458,7 +581,7 @@ public class ThreadPoolTest {
         Thread.sleep(5000);
         assertEquals(pool.getCurrentWorkerCount(), 50);
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 160);
         Thread.sleep(21000);
         assertEquals(pool.getCurrentWorkerCount(), 3);
@@ -474,7 +597,7 @@ public class ThreadPoolTest {
             });
         }
 
-        pool.awaitTermination();
+        pool.join();
         Thread.sleep(5000);
         assertEquals(pool.getCurrentWorkerCount(), 3);
         assertEquals(pool.getIdleWorkerCount(), 3);
@@ -506,7 +629,7 @@ public class ThreadPoolTest {
             });
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 6);
         assertEquals(pool.getCurrentWorkerCount(), 10);
         assertEquals(pool.getIdleWorkerCount(), 10);
@@ -526,7 +649,7 @@ public class ThreadPoolTest {
             });
         }
 
-        pool.awaitTermination();
+        pool.join();
 
         for (int i = 0; i < 10; i++) {
             int finalI = i;
@@ -544,7 +667,7 @@ public class ThreadPoolTest {
             });
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 6);
         assertEquals(pool.getCurrentWorkerCount(), 3);
         assertEquals(pool.getIdleWorkerCount(), 3);
@@ -559,7 +682,7 @@ public class ThreadPoolTest {
             pool.execute(counter::incrementAndGet);
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 3);
         Thread.sleep(6000);
         assertEquals(pool.getCurrentWorkerCount(), 0);
@@ -568,7 +691,7 @@ public class ThreadPoolTest {
             pool.execute(counter::incrementAndGet);
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 6);
     }
 
@@ -702,7 +825,7 @@ public class ThreadPoolTest {
 
         Thread thread1 = new Thread(() -> {
             try {
-                pool.awaitTermination();
+                pool.join();
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
@@ -710,7 +833,7 @@ public class ThreadPoolTest {
         thread1.start();
         Thread thread2 = new Thread(() -> {
             try {
-                pool.awaitTermination();
+                pool.join();
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
@@ -718,7 +841,7 @@ public class ThreadPoolTest {
         thread2.start();
         Thread thread3 = new Thread(() -> {
             try {
-                pool.awaitTermination();
+                pool.join();
             } catch (InterruptedException e) {
                 throw new RuntimeException(e);
             }
@@ -786,7 +909,7 @@ public class ThreadPoolTest {
             }
         }
 
-        pool.awaitTermination();
+        pool.join();
         assertEquals(rejectionCounter.get(), 50);
         assertEquals(counter.get(), 50);
     }
@@ -842,7 +965,7 @@ public class ThreadPoolTest {
             latch.wait();
         }
         pool.shutdownNow();
-        pool.awaitTermination();
+        pool.join();
         assertEquals(counter.get(), 2);
     }
 
@@ -912,7 +1035,7 @@ public class ThreadPoolTest {
         synchronized (latch) {
             latch.wait();
         }
-        pool.awaitTermination();
+        pool.join();
         // if the actual value = 2 that means the race condition did not occur and the queued task got to run
         // try adding a sleep statement at the top of the work loop to extend to possible time window for the race condition
         // to occur

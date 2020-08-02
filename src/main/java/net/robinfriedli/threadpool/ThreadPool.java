@@ -32,6 +32,7 @@ public class ThreadPool extends AbstractExecutorService {
     private final ConcurrentHashMap<Worker, Object> workers = new ConcurrentHashMap<>();
     private final ReentrantLock joinLock = new ReentrantLock();
     private final Condition joinCondVar = joinLock.newCondition();
+    private final Condition terminationCondVar = joinLock.newCondition();
     private final WorkerCountData workerCountData = new WorkerCountData();
 
     private volatile boolean shutdown;
@@ -99,21 +100,7 @@ public class ThreadPool extends AbstractExecutorService {
     @Override
     public void shutdown() {
         shutdown = true;
-        // key set iterator is not guaranteed to see workers added after creation of the iterator, however the shutdown
-        // flag has already been set so workers created after this point will execute their initial task (which is correct
-        // since the task must have been submitted before the shutdown occurred) and then break their work loop upon
-        // checking whether the pool has been shutdown after executing their task, provided the work queue is empty. If
-        // the work queue is not empty each worker will help tidying up the remaining work, however after this point
-        // workers will no longer block while polling from the queue but simply poll once and exit once they receive null.
-        //
-        // Furthermore workers transitioning from or into an idle state are not a concern since they check whether the
-        // pool has been shut down on each transition (after receiving a task from the queue or after finishing a task);
-        // the only goal here is to interrupt threads that are stuck on polling a task from the queue.
-        for (Worker worker : workers.keySet()) {
-            if (worker.idle) {
-                worker.interrupt();
-            }
-        }
+        handleWorkerTermination(true);
     }
 
     @Override
@@ -129,11 +116,7 @@ public class ThreadPool extends AbstractExecutorService {
                 }
             }
         }
-        // key set iterator is not guaranteed to see workers added after creation of the iterator, however the interrupt
-        // flag has already been set so workers created after this point will interrupt themselves either way
-        for (Worker worker : workers.keySet()) {
-            worker.interrupt();
-        }
+        handleWorkerTermination(false);
         return drain;
     }
 
@@ -152,11 +135,22 @@ public class ThreadPool extends AbstractExecutorService {
         if (unit == null) {
             throw new NullPointerException();
         }
-        return join(timeout, unit);
+        return doAwaitTermination(timeout, unit);
     }
 
-    public void awaitTermination() throws InterruptedException {
-        join(null, null);
+    public boolean awaitTermination() throws InterruptedException {
+        return doAwaitTermination(null, null);
+    }
+
+    public boolean join(long timeout, TimeUnit unit) throws InterruptedException {
+        if (unit == null) {
+            throw new NullPointerException();
+        }
+        return doJoin(timeout, unit);
+    }
+
+    public void join() throws InterruptedException {
+        doJoin(null, null);
     }
 
     @Override
@@ -190,6 +184,19 @@ public class ThreadPool extends AbstractExecutorService {
                 rejectedExecutionHandler.handleRejectedExecution(command, this);
             }
         }
+    }
+
+    @Override
+    public String toString() {
+        WorkerCountPair workerData = workerCountData.getBoth();
+        return String.format("%s[shut down: %s, interrupted: %s, terminated: %s, idle workers: %d, total workers: %d, queue size: %d]",
+            super.toString(),
+            shutdown,
+            interrupt,
+            isTerminated(),
+            workerData.getIdleCount(),
+            workerData.getTotalCount(),
+            workQueue.size());
     }
 
     // getters
@@ -230,6 +237,24 @@ public class ThreadPool extends AbstractExecutorService {
         return workerCountData.getIdleWorkerCount();
     }
 
+    private static boolean awaitCondition(ReentrantLock lock, Condition condition, Long timeout, TimeUnit unit) throws InterruptedException {
+        lock.lock();
+        try {
+            if (timeout != null && unit != null) {
+                return condition.await(timeout, unit);
+            } else {
+                condition.await();
+                return true;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static int getNumCpus() {
+        return Runtime.getRuntime().availableProcessors();
+    }
+
     private boolean createWorker(boolean core, Runnable task) {
         WorkerCountPair prevWorkerCountData = workerCountData.incrementWorkerTotalRetBoth();
         // recheck that the worker is still required or if another thread has already created one
@@ -250,7 +275,15 @@ public class ThreadPool extends AbstractExecutorService {
         return true;
     }
 
-    private boolean join(Long timeout, TimeUnit unit) throws InterruptedException {
+    private boolean doAwaitTermination(Long timeout, TimeUnit unit) throws InterruptedException {
+        if (isTerminated()) {
+            return true;
+        }
+
+        return awaitCondition(joinLock, terminationCondVar, timeout, unit);
+    }
+
+    private boolean doJoin(Long timeout, TimeUnit unit) throws InterruptedException {
         WorkerCountPair workerCount = workerCountData.getBoth();
         int idleCount = workerCount.getIdleCount();
         int totalCount = workerCount.getTotalCount();
@@ -259,21 +292,38 @@ public class ThreadPool extends AbstractExecutorService {
             return true;
         }
 
-        joinLock.lock();
-        try {
-            if (timeout != null && unit != null) {
-                return joinCondVar.await(timeout, unit);
-            } else {
-                joinCondVar.await();
-                return true;
-            }
-        } finally {
-            joinLock.unlock();
-        }
+        return awaitCondition(joinLock, joinCondVar, timeout, unit);
     }
 
-    private static int getNumCpus() {
-        return Runtime.getRuntime().availableProcessors();
+    private void handleWorkerTermination(boolean idleOnly) {
+        // notify joiners waiting for termination if the pool is already empty
+        if (workers.isEmpty()) {
+            joinLock.lock();
+            try {
+                terminationCondVar.signalAll();
+            } finally {
+                joinLock.unlock();
+            }
+        } else {
+            // key set iterator is not guaranteed to see workers added after creation of the iterator, however the shutdown
+            // flag has already been set so workers created after this point will execute their initial task (which is correct
+            // since the task must have been submitted before the shutdown occurred) and then break their work loop upon
+            // checking whether the pool has been shutdown after executing their task, provided the work queue is empty. If
+            // the work queue is not empty each worker will help tidying up the remaining work, however after this point
+            // workers will no longer block while polling from the queue but simply poll once and exit once they receive null.
+            //
+            // if shutdownNow() was used that means the pool was interrupted and workers added after this point interrupt
+            // themselves
+            //
+            // Furthermore workers transitioning from or into an idle state are not a concern since they check whether the
+            // pool has been shut down on each transition (after receiving a task from the queue or after finishing a task);
+            // the only goal here is to interrupt threads that are stuck on polling a task from the queue.
+            for (Worker worker : workers.keySet()) {
+                if (!idleOnly || worker.idle) {
+                    worker.interrupt();
+                }
+            }
+        }
     }
 
     public static class Builder {
@@ -466,30 +516,31 @@ public class ThreadPool extends AbstractExecutorService {
                     // (if the worker was newly created and executing its initial task or after polling a task from the
                     // queue) and this method always returns them back to an idle state
                     WorkerCountPair oldWorkerCount = pool.workerCountData.decrementBoth();
-                    // notify joiners once the last worker exits in case a shutdown happened at an inconvenient point
-                    // in time where the last worker to finish any work and become idle sees that there is still work
-                    // in the queue and thus does not notify joiners but none of that work is ever executed because the
-                    // pool was shut down and interrupted (#shutdownNow) immediately after.
-                    //
-                    // For this problem to occur the following race condition needs to happen, which is most likely for
-                    // a pool with a single thread:
-                    // A worker thread finishes its task and increments and compares the worker counts and checks whether
-                    // the queue is empty to decide if joiners should get notified. Finding that the queue is not empty
-                    // the worker decides against notifying and continues the work loop. However after polling the next
-                    // task from the queue but before beginning its execution (hence it is most likely for single threaded
-                    // pools) the worker notices that the pool has been interrupted via #shutdownNow, thus the task is
-                    // never executed. To provoke this race condition for testing the period between finishing execution
-                    // of the last task and polling the queue generally has to be extended artificially through, e.g by
-                    // adding a sleep statement (see test case #testShutDownNowImmediatelyAfterTaskExecutionWithQueuedTasks).
-                    //
-                    // in the worst case joiners that observed the pool to be busy but were never notified after the last
-                    // task was executed due to the aforementioned situation will be notified now that the last worker
-                    // shut down
-                    if (oldWorkerCount.getTotalCount() == 1) {
+                    if (oldWorkerCount.getTotalCount() == 1 && pool.shutdown) {
                         ReentrantLock lock = pool.joinLock;
                         lock.lock();
                         try {
+                            // notify joiners once the last worker exits in case a shutdown happened at an inconvenient point
+                            // in time where the last worker to finish any work and become idle sees that there is still work
+                            // in the queue and thus does not notify joiners but none of that work is ever executed because the
+                            // pool was shut down and interrupted (#shutdownNow) immediately after.
+                            //
+                            // For this problem to occur the following race condition needs to happen, which is most likely for
+                            // a pool with a single thread:
+                            // A worker thread finishes its task and increments and compares the worker counts and checks whether
+                            // the queue is empty to decide if joiners should get notified. Finding that the queue is not empty
+                            // the worker decides against notifying and continues the work loop. However after polling the next
+                            // task from the queue but before beginning its execution (hence it is most likely for single threaded
+                            // pools) the worker notices that the pool has been interrupted via #shutdownNow, thus the task is
+                            // never executed. To provoke this race condition for testing the period between finishing execution
+                            // of the last task and polling the queue generally has to be extended artificially through, e.g by
+                            // adding a sleep statement (see test case #testShutDownNowImmediatelyAfterTaskExecutionWithQueuedTasks).
+                            //
+                            // in the worst case joiners that observed the pool to be busy but were never notified after the last
+                            // task was executed due to the aforementioned situation will be notified now that the last worker
+                            // shut down
                             pool.joinCondVar.signalAll();
+                            pool.terminationCondVar.signalAll();
                         } finally {
                             lock.unlock();
                         }
