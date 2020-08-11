@@ -5,6 +5,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -967,6 +968,49 @@ public class ThreadPoolTest {
         pool.shutdownNow();
         pool.join();
         assertEquals(counter.get(), 2);
+    }
+
+    @Test
+    public void testRejectedExecution() throws InterruptedException {
+        AtomicInteger rejectionCounter = new AtomicInteger(0);
+        ThreadPool pool = ThreadPool.Builder.create()
+            .setCoreSize(3)
+            .setMaxSize(5)
+            .setRejectedExecutionHandler((t, p) -> rejectionCounter.incrementAndGet())
+            .setWorkQueue(new SynchronousQueue<>())
+            .build();
+        AtomicInteger counter = new AtomicInteger(0);
+
+        Object firstExecuteMonitor = new Object();
+
+        for (int i = 0; i < 5; i++) {
+            int finalI = i;
+            new Thread(() -> {
+                for (int j = 0; j < 8; j++) {
+                    pool.execute(() -> {
+                        try {
+                            Thread.sleep(2000);
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                        counter.incrementAndGet();
+                    });
+
+                    if (finalI == 0 && j == 0) {
+                        synchronized (firstExecuteMonitor) {
+                            firstExecuteMonitor.notifyAll();
+                        }
+                    }
+                }
+            }).start();
+        }
+
+        synchronized (firstExecuteMonitor) {
+            firstExecuteMonitor.wait();
+        }
+        pool.join();
+        assertEquals(counter.get(), 5);
+        assertEquals(rejectionCounter.get(), 35);
     }
 
     // provoke a situation where the last thread to become idle does not notify joiners because there are still tasks

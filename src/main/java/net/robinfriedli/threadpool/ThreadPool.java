@@ -505,14 +505,18 @@ public class ThreadPool extends AbstractExecutorService {
         int idleCount = currentWorkerCountData.getIdleCount();
 
         if (totalCount < coreSize) {
-            if (!createWorker(true, command)) {
-                if (!workQueue.offer(command)) {
+            if (!createWorker(true, true, command)) {
+                // if queue offer fails try creating a worker again with strict = false, meaning when attempting to create
+                // a non-core worker it is not checked whether there are idle threads in case this task is losing the
+                // race to be picked up by a worker; this assures that tasks are never rejected while the max pool size
+                // hasn't been reached
+                if (!workQueue.offer(command) && !createWorker(true, false, command)) {
                     rejectedExecutionHandler.handleRejectedExecution(command, this);
                 }
             }
         } else if (totalCount < maxSize && idleCount == 0) {
-            if (!createWorker(false, command)) {
-                if (!workQueue.offer(command)) {
+            if (!createWorker(false, true, command)) {
+                if (!workQueue.offer(command) && !createWorker(false, false, command)) {
                     rejectedExecutionHandler.handleRejectedExecution(command, this);
                 }
             }
@@ -603,7 +607,10 @@ public class ThreadPool extends AbstractExecutorService {
     }
 
     /**
-     * @return the amount of worker threads currently alive in this pool, whether idle or not
+     * @return the amount of worker threads currently alive in this pool, whether idle or not. Note that since this number
+     * is incremented before actually spawning the thread and the old value returned by the atomic increment is used to
+     * to recheck whether the worker is still needed it is possible that this returns a number larger than the maxPoolSize
+     * if called before the total is decremented again when the recheck fails.
      */
     public int getCurrentWorkerCount() {
         return workerCountData.getTotalWorkerCount();
@@ -614,20 +621,6 @@ public class ThreadPool extends AbstractExecutorService {
      */
     public int getIdleWorkerCount() {
         return workerCountData.getIdleWorkerCount();
-    }
-
-    private static boolean awaitCondition(ReentrantLock lock, Condition condition, Long timeout, TimeUnit unit) throws InterruptedException {
-        lock.lock();
-        try {
-            if (timeout != null && unit != null) {
-                return condition.await(timeout, unit);
-            } else {
-                condition.await();
-                return true;
-            }
-        } finally {
-            lock.unlock();
-        }
     }
 
     private static int getNumCpus() {
@@ -642,22 +635,23 @@ public class ThreadPool extends AbstractExecutorService {
      * is already equal to the max pool size limit) this method returns false, causing the task to be submitted to the
      * queue instead.
      *
-     * @param core whether or not the create worker should be a core thread
-     * @param task the initial task for the new worker to execute
+     * @param core   whether or not the create worker should be a core thread
+     * @param strict whether or not to only create a worker if there are no idle threads
+     * @param task   the initial task for the new worker to execute
      * @return whether or not a new worker has actually been created
      */
-    private boolean createWorker(boolean core, Runnable task) {
+    private boolean createWorker(boolean core, boolean strict, Runnable task) {
         WorkerCountPair prevWorkerCountData = workerCountData.incrementWorkerTotalRetBoth();
         // recheck that the worker is still required or if another thread has already created one
         if ((core && prevWorkerCountData.getTotalCount() < coreSize)
-            || (!core && prevWorkerCountData.getTotalCount() < maxSize && prevWorkerCountData.getIdleCount() == 0)) {
+            || (!core && prevWorkerCountData.getTotalCount() < maxSize && (!strict || prevWorkerCountData.getIdleCount() == 0))) {
             new Worker(!core, task).start();
         } else {
             workerCountData.decrementWorkerTotal();
 
-            if (core && prevWorkerCountData.getTotalCount() < maxSize && prevWorkerCountData.getIdleCount() == 0) {
+            if (core && prevWorkerCountData.getTotalCount() < maxSize && (!strict || prevWorkerCountData.getIdleCount() == 0)) {
                 // try create a non-core worker instead if the core pool has been filled up while trying to create this worker
-                return createWorker(false, task);
+                return createWorker(false, strict, task);
             }
 
             return false;
@@ -671,19 +665,53 @@ public class ThreadPool extends AbstractExecutorService {
             return true;
         }
 
-        return awaitCondition(joinLock, terminationCondVar, timeout, unit);
+        joinLock.lock();
+        try {
+            // re-check after acquiring lock
+            if (isTerminated()) {
+                return true;
+            }
+
+            if (timeout != null && unit != null) {
+                return terminationCondVar.await(timeout, unit);
+            } else {
+                terminationCondVar.await();
+                return true;
+            }
+        } finally {
+            joinLock.unlock();
+        }
     }
 
     private boolean doJoin(Long timeout, TimeUnit unit) throws InterruptedException {
-        WorkerCountPair workerCount = workerCountData.getBoth();
-        int idleCount = workerCount.getIdleCount();
-        int totalCount = workerCount.getTotalCount();
-        if (idleCount == totalCount && workQueue.isEmpty()) {
+        if (isIdle()) {
             // no thread is currently doing any work
             return true;
         }
 
-        return awaitCondition(joinLock, joinCondVar, timeout, unit);
+        joinLock.lock();
+        try {
+            // re-check after acquiring lock
+            if (isIdle()) {
+                return true;
+            }
+
+            if (timeout != null && unit != null) {
+                return joinCondVar.await(timeout, unit);
+            } else {
+                joinCondVar.await();
+                return true;
+            }
+        } finally {
+            joinLock.unlock();
+        }
+    }
+
+    private boolean isIdle() {
+        WorkerCountPair workerCount = workerCountData.getBoth();
+        int idleCount = workerCount.getIdleCount();
+        int totalCount = workerCount.getTotalCount();
+        return idleCount == totalCount && workQueue.isEmpty();
     }
 
     private void handleWorkerTermination(boolean idleOnly) {
