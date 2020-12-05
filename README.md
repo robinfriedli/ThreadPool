@@ -1,5 +1,32 @@
 # ThreadPool
 
+## Maven
+```xml
+    <dependency>
+      <groupId>net.robinfriedli</groupId>
+      <artifactId>ThreadPool</artifactId>
+      <version>1.0</version>
+      <type>pom</type>
+    </dependency>
+
+    <repository>
+        <id>jcenter</id>
+        <name>jcenter-bintray</name>
+        <url>https://jcenter.bintray.com</url>
+    </repository>
+```
+
+## Gradle
+```gradle
+    dependencies {
+        implementation "net.robinfriedli:ThreadPool:1.0"
+    }
+
+    repositories {
+        jcenter()
+    }
+```
+
 This repo is a Java port of the corresponding [Rust implementation](https://github.com/robinfriedli/rusty_pool)
 
 Scalable self growing / shrinking ThreadPool implementation. This ThreadPool implements the ExecutorService
