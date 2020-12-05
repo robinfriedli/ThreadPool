@@ -1,5 +1,7 @@
 plugins {
     id "java"
+    id "maven-publish"
+    id "com.jfrog.bintray" version "1.8.5"
 }
 
 group "net.robinfriedli"
@@ -18,7 +20,43 @@ dependencies {
     testCompile "com.google.truth:truth:1.0.1"
 }
 
+task sourceJar(type: Jar) {
+    classifier 'sources'
+    from sourceSets.main.allJava
+}
 
 test {
     useTestNG()
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            groupId rootProject.group
+            artifactId "ThreadPool"
+
+            from(components.java)
+
+            artifact tasks.sourceJar
+        }
+    }
+}
+
+def bintrayProperties = new Properties()
+def bintrayPropertiesFile = file("src/main/resources/bintray.properties")
+if (bintrayPropertiesFile.exists()) {
+    bintrayPropertiesFile.withInputStream { bintrayProperties.load(it) }
+} else {
+    bintrayProperties.setProperty("bintray.user", "empty")
+    bintrayProperties.setProperty("bintray.key", "empty")
+}
+
+bintray {
+    user = bintrayProperties.get("bintray.user")
+    key = bintrayProperties.get("bintray.key")
+    publications = ['maven']
+    pkg {
+        repo = rootProject.group
+        name = "ThreadPool"
+    }
 }
