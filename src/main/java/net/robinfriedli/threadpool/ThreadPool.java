@@ -320,8 +320,12 @@ public class ThreadPool extends AbstractExecutorService {
         this.threadFactory = threadFactory;
         this.rejectedExecutionHandler = rejectedExecutionHandler;
 
-        if (maxSize == 0 || maxSize < coreSize) {
-            throw new IllegalArgumentException("Max size cannot be 0 or less than core size");
+        if (maxSize <= 0 || maxSize < coreSize || coreSize < 0) {
+            throw new IllegalArgumentException("Max size cannot be less than 1 or less than core size and core size cannot be negative");
+        }
+
+        if (keepAliveTime < 0) {
+            throw new IllegalArgumentException("Keep alive time cannot be negative");
         }
 
         if (keepAliveUnit == null || workQueue == null || threadFactory == null || rejectedExecutionHandler == null) {

@@ -176,6 +176,21 @@ public class ThreadPoolTest {
         new ThreadPool(10, 4);
     }
 
+    @Test(expectedExceptions = IllegalArgumentException.class)
+    public void testNegativeMaxPoolSize() {
+        new ThreadPool(-5, -3);
+    }
+
+    @Test(expectedExceptions = IllegalArgumentException.class)
+    public void testNegativeCorePoolSize() {
+        new ThreadPool(-1, 1);
+    }
+
+    @Test(expectedExceptions = IllegalArgumentException.class)
+    public void testNegativeKeepAliveTime() {
+        new ThreadPool(1, 1, -1, TimeUnit.SECONDS);
+    }
+
     @Test
     public void testEmptyJoin() throws InterruptedException {
         ThreadPool pool = new ThreadPool(3, 10, 10, TimeUnit.SECONDS);
