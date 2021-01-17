@@ -4,8 +4,10 @@ plugins {
     id "com.jfrog.bintray" version "1.8.5"
 }
 
+def artifact = "ThreadPool"
+
 group "net.robinfriedli"
-version "1.0"
+version "1.0.1"
 sourceCompatibility = "8"
 targetCompatibility = "8"
 
@@ -20,24 +22,17 @@ dependencies {
     testCompile "com.google.truth:truth:1.1"
 }
 
-task sourceJar(type: Jar) {
-    classifier 'sources'
-    from sourceSets.main.allJava
-}
-
 test {
     useTestNG()
 }
 
 publishing {
     publications {
-        maven(MavenPublication) {
-            groupId rootProject.group
-            artifactId "ThreadPool"
-
-            from(components.java)
-
-            artifact tasks.sourceJar
+        release(MavenPublication) {
+            groupId = rootProject.group
+            artifactId = artifact
+            version = rootProject.version
+            from components.java
         }
     }
 }
@@ -54,9 +49,16 @@ if (bintrayPropertiesFile.exists()) {
 bintray {
     user = bintrayProperties.get("bintray.user")
     key = bintrayProperties.get("bintray.key")
-    publications = ['maven']
+    publications = ["release"]
     pkg {
         repo = rootProject.group
         name = "ThreadPool"
+        description "Scalable self growing / shrinking ThreadPool implementation. This ThreadPool implements the ExecutorService interface and offers an alternative for the JDK ThreadPoolExecutor implementation that prioritizes creating new worker threads above queueing tasks for better potential throughput and flexibility."
+        licenses = ["Apache-2.0"]
+        vcsUrl = "https://github.com/robinfriedli/ThreadPool"
+        version {
+            name = rootProject.version
+            released = new Date()
+        }
     }
 }
