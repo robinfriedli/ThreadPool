@@ -1,6 +1,7 @@
 package net.robinfriedli.threadpool;
 
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -521,14 +522,14 @@ public class ThreadPoolTest {
 
         assertEquals(workerCountData.getTotalWorkerCount(), 26);
         assertEquals(workerCountData.getIdleWorkerCount(), 18);
-        ThreadPool.WorkerCountPair both = workerCountData.getBoth();
-        assertEquals(both.getTotalCount(), 26);
-        assertEquals(both.getIdleCount(), 18);
+        long both = workerCountData.getBoth();
+        assertEquals(ThreadPool.WorkerCountData.getTotalCount(both), 26);
+        assertEquals(ThreadPool.WorkerCountData.getIdleCount(both), 18);
 
         for (int i = 0; i < 5; i++) {
-            ThreadPool.WorkerCountPair oldVal = workerCountData.decrementBoth();
-            assertEquals(oldVal.getTotalCount(), 26 - i);
-            assertEquals(oldVal.getIdleCount(), 18 - i);
+            long oldVal = workerCountData.decrementBoth();
+            assertEquals(ThreadPool.WorkerCountData.getTotalCount(oldVal), 26 - i);
+            assertEquals(ThreadPool.WorkerCountData.getIdleCount(oldVal), 18 - i);
         }
 
         assertEquals(workerCountData.getTotalWorkerCount(), 21);
@@ -551,9 +552,9 @@ public class ThreadPoolTest {
 
         assertEquals(workerCountData.getTotalWorkerCount(), 456797);
         assertEquals(workerCountData.getIdleWorkerCount(), 9);
-        ThreadPool.WorkerCountPair both1 = workerCountData.getBoth();
-        assertEquals(both1.getTotalCount(), 456797);
-        assertEquals(both1.getIdleCount(), 9);
+        long both1 = workerCountData.getBoth();
+        assertEquals(ThreadPool.WorkerCountData.getTotalCount(both1), 456797);
+        assertEquals(ThreadPool.WorkerCountData.getIdleCount(both1), 9);
 
         for (int i = 0; i < 23456; i++) {
             workerCountData.incrementWorkerIdle();
@@ -575,6 +576,47 @@ public class ThreadPoolTest {
 
         assertEquals(workerCountData.getTotalWorkerCount(), 306797);
         assertEquals(workerCountData.getIdleWorkerCount(), 13465);
+    }
+
+    @Test
+    public void testTryIncrementWorkerTotal() throws InterruptedException {
+        ThreadPool.WorkerCountData workerCountData = new ThreadPool.WorkerCountData();
+
+        long witness = workerCountData.tryIncrementTotalCount(0, 5);
+        assertEquals(witness, 0);
+        long both = workerCountData.getBoth();
+        assertEquals(ThreadPool.WorkerCountData.getTotalCount(both), 1);
+        assertEquals(ThreadPool.WorkerCountData.getIdleCount(both), 0);
+
+        long witness1 = workerCountData.tryIncrementTotalCount(0, 5);
+        assertEquals(witness1, 0x0000_0001_0000_0000L);
+        long both1 = workerCountData.getBoth();
+        assertEquals(ThreadPool.WorkerCountData.getTotalCount(both1), 2);
+        assertEquals(ThreadPool.WorkerCountData.getIdleCount(both1), 0);
+
+        workerCountData.tryIncrementTotalCount(2, 5);
+        workerCountData.tryIncrementTotalCount(2, 5);
+        workerCountData.tryIncrementTotalCount(4, 5);
+        workerCountData.tryIncrementTotalCount(4, 5);
+        long witness2 = workerCountData.tryIncrementTotalCount(4, 5);
+        assertEquals(ThreadPool.WorkerCountData.getTotalCount(witness2), 5);
+        assertEquals(ThreadPool.WorkerCountData.getIdleCount(witness2), 0);
+        assertEquals(workerCountData.getTotalWorkerCount(), 5);
+        assertEquals(workerCountData.getIdleWorkerCount(), 0);
+
+        CountDownLatch countDownLatch = new CountDownLatch(25);
+        for (int i = 0; i < 5; i++) {
+            new Thread(() -> {
+                for (int j = 0; j < 5; j++) {
+                    workerCountData.tryIncrementTotalCount(5 + j, 15);
+                    countDownLatch.countDown();
+                }
+            }).start();
+        }
+
+        countDownLatch.await();
+        assertEquals(workerCountData.getTotalWorkerCount(), 15);
+        assertEquals(workerCountData.getIdleWorkerCount(), 0);
     }
 
     @Test

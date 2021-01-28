@@ -20,14 +20,15 @@ import java.util.function.Supplier;
  * prioritizes creating new worker threads above queueing tasks for better potential throughput and flexibility.
  * <p>
  * This ThreadPool has two different pool sizes; a core pool size filled with threads that live for as long as the pool
- * and only exit once the pool is shut down and a max pool size which describes the maximum number of worker threads
+ * and only exit once the pool is shut down, and a max pool size which describes the maximum number of worker threads
  * that may live at the same time. Those additional non-core threads have a specific keep-alive time specified when
  * creating the ThreadPool that defines how long such threads may be idle for without receiving any work before giving
  * up and terminating their work loop.
  * <p>
  * This ThreadPool does not spawn any threads until a task is submitted to it. Then it will create a new thread for each
  * task until the core pool is full. After that a new thread will only be created upon an {@link #execute(Runnable)} call
- * if the current pool size is lower than the max pool size and there are no idle threads.
+ * if the current pool size is lower than the max pool size and there are no idle threads. Additionally, a new worker is
+ * always created if offering a task to the queue fails, and the pool size is below the maximum pool size.
  * <p>
  * This is one of the major differences in implementation compared to the {@link java.util.concurrent.ThreadPoolExecutor},
  * which only creates a new worker thread if the pool size is below the core size or if submitting the task to the queue
@@ -43,7 +44,7 @@ import java.util.function.Supplier;
  * meaningless when choosing this option.
  * <p>
  * 2: Using a bounded queue; In this case additional non-core workers are created after the bounded queue is full. If
- * the queue is full and the pool is at its maximum size the pool will start rejecting tasks.
+ * the queue is full, and the pool is at its maximum size, the pool will start rejecting tasks.
  * <p>
  * 3: Using a zero-capacity {@link java.util.concurrent.SynchronousQueue}; With this option there technically is no queue.
  * Queue submissions always fail if there is no idle thread polling the queue. So new worker threads are spawned whenever
@@ -57,7 +58,7 @@ import java.util.function.Supplier;
  * This ThreadPool allows users to use an unbounded queue to store up to {@link Integer#MAX_VALUE} tasks while having a
  * flexible pool that dynamically creates new worker threads if there are no idle threads.
  * <p>
- * Since this ThreadPool implements the {@link java.util.concurrent.ExecutorService} interface it offers the same methods
+ * Since this ThreadPool implements the {@link java.util.concurrent.ExecutorService} interface, it offers the same methods
  * to execute tasks. The {@link #execute(Runnable)} method simply submits a task for execution to the ThreadPool.
  * {@link #submit(java.util.concurrent.Callable)} can be used to await the result of running the provided callable.
  * <p>
@@ -70,7 +71,7 @@ import java.util.function.Supplier;
  * Locks are only used for the {@link #join()} and {@link #awaitTermination()} functionalities to obtain the monitor for
  * the respective {@link Condition}. Workers are stored in a {@link ConcurrentHashMap} and all bookkeeping is based on
  * atomic operations. This ThreadPool decides whether it is currently idle (and should fast-return join attempts) by
- * comparing the total worker count to the idle worker count, which are two 32 bit numbers stored in a single {@link AtomicLong}
+ * comparing the total worker count to the idle worker count, which are two 32-bit numbers stored in a single {@link AtomicLong}
  * making sure that if both should be updated they may be updated in a single atomic operation.
  * <p>
  * Usage:
@@ -489,8 +490,9 @@ public class ThreadPool extends AbstractExecutorService {
      * the {@link RejectedExecutionHandler} specified when initializing the pool is called immediately. This method might
      * spawn a new worker thread if the current pool size is lower than the core pool size or the current pool size is lower
      * than the maximum pool size and there are no idle threads. Else the submitted task is offered to the workQueue, if
-     * that fails because the queue rejects the task (e.g. when using a bounded queue and the queue is full) the
-     * {@link RejectedExecutionHandler} is called.
+     * that fails because the queue rejects the task (e.g. when using a bounded queue and the queue is full) the pool tries
+     * creating a worker again if the current pool size is below the specified maxPoolSize, regardless of whether there are
+     * idle workers, if that fails the supplied {@link RejectedExecutionHandler} is called.
      *
      * @param command the runnable to run
      */
@@ -504,31 +506,51 @@ public class ThreadPool extends AbstractExecutorService {
             return;
         }
 
-        WorkerCountPair currentWorkerCountData = workerCountData.getBoth();
-        int totalCount = currentWorkerCountData.getTotalCount();
-        int idleCount = currentWorkerCountData.getIdleCount();
+        long currentWorkerCountData = workerCountData.getBoth();
+        int totalCount = WorkerCountData.getTotalCount(currentWorkerCountData);
+        int idleCount = WorkerCountData.getIdleCount(currentWorkerCountData);
+        int currentIdleCount = idleCount;
 
+        // always create a new worker if current pool size is below core size
         if (totalCount < coreSize) {
-            if (!createWorker(true, true, command)) {
-                // if queue offer fails try creating a worker again with strict = false, meaning when attempting to create
-                // a non-core worker it is not checked whether there are idle threads in case this task is losing the
-                // race to be picked up by a worker; this assures that tasks are never rejected while the max pool size
-                // hasn't been reached
-                if (!workQueue.offer(command) && !createWorker(true, false, command)) {
-                    rejectedExecutionHandler.handleRejectedExecution(command, this);
-                }
+            long witnessed = workerCountData.tryIncrementTotalCount(currentWorkerCountData, coreSize);
+
+            // the witnessed value matched the expected value, meaning the initial exchange succeeded, or the final witnessed
+            // value is still below the coreSize, meaning the increment eventually succeeded
+            if (witnessed == currentWorkerCountData || (totalCount = WorkerCountData.getTotalCount(witnessed)) < coreSize) {
+                new Worker(false, command).start();
+                return;
             }
-        } else if (totalCount < maxSize && idleCount == 0) {
-            if (!createWorker(false, true, command)) {
-                if (!workQueue.offer(command) && !createWorker(false, false, command)) {
-                    rejectedExecutionHandler.handleRejectedExecution(command, this);
-                }
-            }
-        } else {
-            if (!workQueue.offer(command)) {
-                rejectedExecutionHandler.handleRejectedExecution(command, this);
+
+            currentIdleCount = WorkerCountData.getIdleCount(witnessed);
+            currentWorkerCountData = witnessed;
+        }
+
+        // create a new worker if the current worker count is below the maxSize and the pool has been observed to be busy
+        // (no idle workers) during the invocation of this method
+        if (totalCount < maxSize && (idleCount == 0 || currentIdleCount == 0)) {
+            long witnessed = workerCountData.tryIncrementTotalCount(currentWorkerCountData, maxSize);
+
+            if (witnessed == currentWorkerCountData || WorkerCountData.getTotalCount(witnessed) < maxSize) {
+                new Worker(true, command).start();
+                return;
             }
         }
+
+        if (workQueue.offer(command)) {
+            return;
+        }
+
+        // if no worker was created because of the presence of idle workers yet offering the task to the queue failed, try
+        // creating a worker again irregardless of idle workers
+        if (totalCount < maxSize) {
+            if (workerCountData.tryIncrementTotalCount(currentWorkerCountData, maxSize) < maxSize) {
+                new Worker(true, command).start();
+                return;
+            }
+        }
+
+        rejectedExecutionHandler.handleRejectedExecution(command, this);
     }
 
     /**
@@ -548,14 +570,14 @@ public class ThreadPool extends AbstractExecutorService {
      */
     @Override
     public String toString() {
-        WorkerCountPair workerData = workerCountData.getBoth();
+        long workerData = workerCountData.getBoth();
         return String.format("%s[shut down: %s, interrupted: %s, terminated: %s, idle workers: %d, total workers: %d, queue size: %d]",
             super.toString(),
             shutdown,
             interrupt,
             isTerminated(),
-            workerData.getIdleCount(),
-            workerData.getTotalCount(),
+            WorkerCountData.getIdleCount(workerData),
+            WorkerCountData.getTotalCount(workerData),
             workQueue.size());
     }
 
@@ -611,10 +633,7 @@ public class ThreadPool extends AbstractExecutorService {
     }
 
     /**
-     * @return the amount of worker threads currently alive in this pool, whether idle or not. Note that since this number
-     * is incremented before actually spawning the thread and the old value returned by the atomic increment is used to
-     * to recheck whether the worker is still needed it is possible that this returns a number larger than the maxPoolSize
-     * if called before the total is decremented again when the recheck fails.
+     * @return the amount of worker threads currently alive in this pool, whether idle or not.
      */
     public int getCurrentWorkerCount() {
         return workerCountData.getTotalWorkerCount();
@@ -629,39 +648,6 @@ public class ThreadPool extends AbstractExecutorService {
 
     private static int getNumCpus() {
         return Runtime.getRuntime().availableProcessors();
-    }
-
-    /**
-     * Create a new worker thread. This atomically increments the total worker count of the worker count data and uses
-     * the previous value to determine whether the new worker is still needed. If trying to create a core worker and noticing
-     * the core pool is already full (i.e. the previous worker total is already equal to the core size limit) this method
-     * attempts to create a non-core worker instead. If the max pool size has already been reached (i.e. the previous total
-     * is already equal to the max pool size limit) this method returns false, causing the task to be submitted to the
-     * queue instead.
-     *
-     * @param core   whether or not the create worker should be a core thread
-     * @param strict whether or not to only create a worker if there are no idle threads
-     * @param task   the initial task for the new worker to execute
-     * @return whether or not a new worker has actually been created
-     */
-    private boolean createWorker(boolean core, boolean strict, Runnable task) {
-        WorkerCountPair prevWorkerCountData = workerCountData.incrementWorkerTotalRetBoth();
-        // recheck that the worker is still required or if another thread has already created one
-        if ((core && prevWorkerCountData.getTotalCount() < coreSize)
-            || (!core && prevWorkerCountData.getTotalCount() < maxSize && (!strict || prevWorkerCountData.getIdleCount() == 0))) {
-            new Worker(!core, task).start();
-        } else {
-            workerCountData.decrementWorkerTotal();
-
-            if (core && prevWorkerCountData.getTotalCount() < maxSize && (!strict || prevWorkerCountData.getIdleCount() == 0)) {
-                // try create a non-core worker instead if the core pool has been filled up while trying to create this worker
-                return createWorker(false, strict, task);
-            }
-
-            return false;
-        }
-
-        return true;
     }
 
     private boolean doAwaitTermination(Long timeout, TimeUnit unit) throws InterruptedException {
@@ -712,9 +698,9 @@ public class ThreadPool extends AbstractExecutorService {
     }
 
     private boolean isIdle() {
-        WorkerCountPair workerCount = workerCountData.getBoth();
-        int idleCount = workerCount.getIdleCount();
-        int totalCount = workerCount.getTotalCount();
+        long workerCount = workerCountData.getBoth();
+        int idleCount = WorkerCountData.getIdleCount(workerCount);
+        int totalCount = WorkerCountData.getTotalCount(workerCount);
         return idleCount == totalCount && workQueue.isEmpty();
     }
 
@@ -964,8 +950,9 @@ public class ThreadPool extends AbstractExecutorService {
     private final class Worker implements Runnable {
 
         private final boolean canTimeOut;
-        private final Runnable initialTask;
         private final Thread thread;
+
+        private Runnable initialTask;
 
         private volatile boolean idle;
 
@@ -984,6 +971,7 @@ public class ThreadPool extends AbstractExecutorService {
                 boolean continueLoop = true;
                 if (initialTask != null) {
                     continueLoop = execTaskAndNotify(initialTask);
+                    initialTask = null;
                 }
 
                 while (continueLoop) {
@@ -1027,8 +1015,8 @@ public class ThreadPool extends AbstractExecutorService {
                     // workers are only ever non-idle during (and immediately before) a call to #execTaskAndNotify
                     // (if the worker was newly created and executing its initial task or after polling a task from the
                     // queue) and this method always returns them back to an idle state
-                    WorkerCountPair oldWorkerCount = pool.workerCountData.decrementBoth();
-                    if (oldWorkerCount.getTotalCount() == 1 && pool.shutdown) {
+                    long oldWorkerCount = pool.workerCountData.decrementBoth();
+                    if (WorkerCountData.getTotalCount(oldWorkerCount) == 1 && pool.shutdown) {
                         ReentrantLock lock = pool.joinLock;
                         lock.lock();
                         try {
@@ -1081,10 +1069,10 @@ public class ThreadPool extends AbstractExecutorService {
                 // check also serves to clear interrupt flag
                 return !(Thread.interrupted() && pool.interrupt || pool.interrupt);
             } finally {
-                WorkerCountPair workerCountPair = pool.workerCountData.incrementWorkerIdleRetBoth();
-                int previousTotal = workerCountPair.getTotalCount();
-                int previousIdle = workerCountPair.getIdleCount();
-                if (pool.workQueue.isEmpty() && previousTotal == previousIdle + 1) {
+                long workerCountData = pool.workerCountData.incrementWorkerIdleRetBoth();
+                int previousTotal = WorkerCountData.getTotalCount(workerCountData);
+                int previousIdle = WorkerCountData.getIdleCount(workerCountData);
+                if (previousTotal == previousIdle + 1 && pool.workQueue.isEmpty()) {
                     ReentrantLock lock = pool.joinLock;
                     lock.lock();
                     try {
@@ -1117,26 +1105,51 @@ public class ThreadPool extends AbstractExecutorService {
             return getIdleCount(workerCountData.get());
         }
 
-        WorkerCountPair getBoth() {
-            return split(workerCountData.get());
+        long getBoth() {
+            return workerCountData.get();
         }
 
-        WorkerCountPair incrementBoth() {
-            long prev = workerCountData.getAndAdd(0x0000_0001_0000_0001L);
-            return split(prev);
+        /**
+         * Tries to increment the total worker count until it succeeds (the current value matches the expected value and thus
+         * the expected value + 1 is set as new value successfully) or until the observed actual value reaches the specified maxTotal.
+         * In any case the method returns the last observed value of workerCountData, the callee can check whether the increment
+         * was successful by checking whether the totalCount of the returned value is below the provided maxTotal, else the
+         * totalCount was incremented to the maxTotal by other threads, meaning this call fails.
+         *
+         * @param expectedVal the expected current value of workerCountData, the totalCount of this value must be below maxTotal
+         * @param maxTotal    the maximum the total may be incremented to before giving up
+         * @return the last witnessed value of workerCountData, if the totalCount of the returned value is equal to the
+         * provided maxTotal, that means the increment has not succeeded, if the totalCount of the returned value is below
+         * the maxTotal, that means the total has been incremented to the totalCount of the witnessed value + 1 successfully.
+         */
+        long tryIncrementTotalCount(long expectedVal, int maxTotal) {
+            for (; ; ) {
+                long witness = workerCountData.compareAndExchange(expectedVal, expectedVal + 0x0000_0001_0000_0000L);
+                // if the witnessed value matches the expected value the exchange succeeded -> return
+                // if the witnessed total count reached the maximum total -> give up
+                if (witness == expectedVal || getTotalCount(witness) == maxTotal) {
+                    return witness;
+                }
+
+                expectedVal = witness;
+            }
         }
 
-        WorkerCountPair decrementBoth() {
+        long incrementBoth() {
+            return workerCountData.getAndAdd(0x0000_0001_0000_0001L);
+        }
+
+        long decrementBoth() {
             long negativeVal = (~0x0000_0001_0000_0001L) + 1;
-            return split(workerCountData.getAndAdd(negativeVal));
+            return workerCountData.getAndAdd(negativeVal);
         }
 
         int incrementWorkerTotal() {
             return getTotalCount(workerCountData.getAndAdd(0x0000_0001_0000_0000L));
         }
 
-        WorkerCountPair incrementWorkerTotalRetBoth() {
-            return split(workerCountData.getAndAdd(0x0000_0001_0000_0000L));
+        long incrementWorkerTotalRetBoth() {
+            return workerCountData.getAndAdd(0x0000_0001_0000_0000L);
         }
 
         int decrementWorkerTotal() {
@@ -1144,17 +1157,17 @@ public class ThreadPool extends AbstractExecutorService {
             return getTotalCount(workerCountData.getAndAdd(negativeVal));
         }
 
-        WorkerCountPair decrementWorkerTotalRetBoth() {
+        long decrementWorkerTotalRetBoth() {
             long negativeVal = (~0x0000_0001_0000_0000L) + 1;
-            return split(workerCountData.getAndAdd(negativeVal));
+            return workerCountData.getAndAdd(negativeVal);
         }
 
         int incrementWorkerIdle() {
             return getIdleCount(workerCountData.getAndAdd(0x0000_0000_0000_0001L));
         }
 
-        WorkerCountPair incrementWorkerIdleRetBoth() {
-            return split(workerCountData.getAndAdd(0x0000_0000_0000_0001L));
+        long incrementWorkerIdleRetBoth() {
+            return workerCountData.getAndAdd(0x0000_0000_0000_0001L);
         }
 
         int decrementWorkerIdle() {
@@ -1162,15 +1175,9 @@ public class ThreadPool extends AbstractExecutorService {
             return getIdleCount(workerCountData.getAndAdd(negativeVal));
         }
 
-        WorkerCountPair decrementWorkerIdleRetBoth() {
+        long decrementWorkerIdleRetBoth() {
             long negativeVal = (~0x0000_0000_0000_0001L) + 1;
-            return split(workerCountData.getAndAdd(negativeVal));
-        }
-
-        static WorkerCountPair split(long val) {
-            int totalCount = (int) (val >> 32);
-            int idleCount = (int) (val & WORKER_IDLE_MASK);
-            return new WorkerCountPair(totalCount, idleCount);
+            return workerCountData.getAndAdd(negativeVal);
         }
 
         static int getIdleCount(long val) {
@@ -1181,25 +1188,6 @@ public class ThreadPool extends AbstractExecutorService {
             return (int) (val >> 32);
         }
 
-    }
-
-    static final class WorkerCountPair {
-
-        private final int totalCount;
-        private final int idleCount;
-
-        WorkerCountPair(int totalCount, int idleCount) {
-            this.totalCount = totalCount;
-            this.idleCount = idleCount;
-        }
-
-        public int getTotalCount() {
-            return totalCount;
-        }
-
-        public int getIdleCount() {
-            return idleCount;
-        }
     }
 
 }

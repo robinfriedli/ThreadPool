@@ -5,7 +5,7 @@
     <dependency>
       <groupId>net.robinfriedli</groupId>
       <artifactId>ThreadPool</artifactId>
-      <version>1.0.1</version>
+      <version>1.1</version>
       <type>pom</type>
     </dependency>
 
@@ -19,13 +19,18 @@
 ## Gradle
 ```gradle
     dependencies {
-        implementation "net.robinfriedli:ThreadPool:1.0.1"
+        implementation "net.robinfriedli:ThreadPool:1.1"
     }
 
     repositories {
         jcenter()
     }
 ```
+
+## Requirements
+
+Version 1.1 requires Java 9 due to the introduction of additional atomic operations (namely AtomicLong#compareAndExchange).
+Versions below 1.1 require Java 8.
 
 This repo is a Java port of the corresponding [Rust implementation](https://github.com/robinfriedli/rusty_pool)
 
@@ -34,14 +39,15 @@ interface and offers an alternative for the JDK ThreadPoolExecutor implementatio
 threads above queueing tasks for better potential throughput and flexibility.
 
 This ThreadPool has two different pool sizes; a core pool size filled with threads that live for as long as the pool
-and only exit once the pool is shut down and a max pool size which describes the maximum number of worker threads
+and only exit once the pool is shut down, and a max pool size which describes the maximum number of worker threads
 that may live at the same time. Those additional non-core threads have a specific keep-alive time specified when
 creating the ThreadPool that defines how long such threads may be idle for without receiving any work before giving
 up and terminating their work loop.
 
 This ThreadPool does not spawn any threads until a task is submitted to it. Then it will create a new thread for each
 task until the core pool is full. After that a new thread will only be created upon an #execute call
-if the current pool size is lower than the max pool size and there are no idle threads.
+if the current pool size is lower than the max pool size and there are no idle threads. Additionally, a new worker is
+always created if offering a task to the queue fails, and the pool size is below the maximum pool size.
 
 This is one of the major differences in implementation compared to the ThreadPoolExecutor, which only creates a new worker
 thread if the pool size is below the core size or if submitting the task to the queue fails. So when using an unbounded
@@ -57,7 +63,7 @@ unless core pool thread timeout is enabled, essentially meaning there is no core
 meaningless when choosing this option.
 
 2. Using a bounded queue; In this case additional non-core workers are created after the bounded queue is full. If
-the queue is full and the pool is at its maximum size the pool will start rejecting tasks.
+the queue is full, and the pool is at its maximum size, the pool will start rejecting tasks.
 
 3. Using a zero-capacity SynchronousQueue; With this option there technically is no queue.
 Queue submissions always fail if there is no idle thread polling the queue. So new worker threads are spawned whenever
@@ -71,7 +77,7 @@ pool reaches its maximum size because there is no queue.
 This ThreadPool allows users to use an unbounded queue to store up to Integer.MAX_VALUE tasks while having a
 flexible pool that dynamically creates new worker threads if there are no idle threads.
 
-Since this ThreadPool implements the ExecutorService interface it offers the same methods to execute tasks.
+Since this ThreadPool implements the ExecutorService interface, it offers the same methods to execute tasks.
 The #execute method simply submits a task for execution to the ThreadPool. The #submit method returns a Future which
 can be used to await the result of running the provided callable.
 
@@ -84,7 +90,7 @@ revived immediately.
 Locks are only used for the #join and #awaitTermination functionalities to obtain the monitor for
 the respective Condition. Workers are stored in a ConcurrentHashMap and all bookkeeping is based on
 atomic operations. This ThreadPool decides whether it is currently idle (and should fast-return join attempts) by
-comparing the total worker count to the idle worker count, which are two 32 bit numbers stored in a single AtomicLong
+comparing the total worker count to the idle worker count, which are two 32-bit numbers stored in a single AtomicLong
 making sure that if both should be updated they may be updated in a single atomic operation.
 
 Usage:
