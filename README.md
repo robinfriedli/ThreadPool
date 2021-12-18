@@ -5,7 +5,7 @@
     <dependency>
       <groupId>com.github.robinfriedli</groupId>
       <artifactId>ThreadPool</artifactId>
-      <version>1.1.2</version>
+      <version>1.1.3</version>
       <type>pom</type>
     </dependency>
 
@@ -18,7 +18,7 @@
 ## Gradle
 ```gradle
     dependencies {
-        implementation "com.github.robinfriedli:ThreadPool:1.1.2"
+        implementation "com.github.robinfriedli:ThreadPool:1.1.3"
     }
 
     repositories {
