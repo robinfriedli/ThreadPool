@@ -3,27 +3,26 @@
 ## Maven
 ```xml
     <dependency>
-      <groupId>net.robinfriedli</groupId>
+      <groupId>com.github.robinfriedli</groupId>
       <artifactId>ThreadPool</artifactId>
-      <version>1.1</version>
+      <version>1.1.1</version>
       <type>pom</type>
     </dependency>
 
     <repository>
-        <id>jcenter</id>
-        <name>jcenter-bintray</name>
-        <url>https://jcenter.bintray.com</url>
+        <name>jitpack.io</name>
+        <url>https://jitpack.io</url>
     </repository>
 ```
 
 ## Gradle
 ```gradle
     dependencies {
-        implementation "net.robinfriedli:ThreadPool:1.1"
+        implementation "com.github.robinfriedli:ThreadPool:1.1.1"
     }
 
     repositories {
-        jcenter()
+        maven { url "https://jitpack.io" }
     }
 ```
 
