@@ -1,7 +1,6 @@
 package net.robinfriedli.threadpool;
 
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -1069,25 +1068,6 @@ public class ThreadPoolTest {
         pool.join();
         assertEquals(counter.get(), 5);
         assertEquals(rejectionCounter.get(), 35);
-    }
-
-    @Test
-    public void testStartCoreThreads() {
-        ThreadPool pool = ThreadPool.Builder.create().setCoreSize(5).build();
-        pool.startCoreThreads();
-        assertEquals(pool.getCurrentWorkerCount(), 5);
-        assertEquals(pool.getIdleWorkerCount(), 5);
-    }
-
-    @Test
-    public void testStartAndUseCoreThreads() throws ExecutionException, InterruptedException {
-        ThreadPool pool = ThreadPool.Builder.create().setCoreSize(5).setMaxSize(10).setKeepAlive(Long.MAX_VALUE, TimeUnit.SECONDS).build();
-        pool.startCoreThreads();
-        CompletableFuture<Integer> futureResult = new CompletableFuture<>();
-        pool.execute(() -> futureResult.complete(5 + 5));
-        int result = futureResult.get();
-        assertEquals(result, 10);
-        assertEquals(pool.getCurrentWorkerCount(), 5);
     }
 
     // provoke a situation where the last thread to become idle does not notify joiners because there are still tasks
