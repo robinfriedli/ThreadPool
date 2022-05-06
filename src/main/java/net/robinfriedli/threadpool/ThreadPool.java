@@ -646,6 +646,31 @@ public class ThreadPool extends AbstractExecutorService {
         return workerCountData.getIdleWorkerCount();
     }
 
+    /**
+     * Starts all core workers by creating core idle workers until the total worker count reaches the core count.
+     * <p>
+     * Returns immediately if the current worker count is already >= core size.
+     */
+    public void startCoreThreads() {
+        long currentWorkerCount = workerCountData.getBoth();
+        if (WorkerCountData.getTotalCount(currentWorkerCount) >= coreSize) {
+            return;
+        }
+
+        for (; ; ) {
+            long witnessed = workerCountData.tryIncrementWorkerCount(currentWorkerCount, 0x0000_0001_0000_0001L, coreSize);
+
+            if (WorkerCountData.getTotalCount(witnessed) >= coreSize) {
+                return;
+            }
+
+            Worker worker = new Worker(false, null);
+            worker.start();
+
+            currentWorkerCount = witnessed;
+        }
+    }
+
     private static int getNumCpus() {
         return Runtime.getRuntime().availableProcessors();
     }
@@ -1123,11 +1148,15 @@ public class ThreadPool extends AbstractExecutorService {
          * the maxTotal, that means the total has been incremented to the totalCount of the witnessed value + 1 successfully.
          */
         long tryIncrementTotalCount(long expectedVal, int maxTotal) {
+            return tryIncrementWorkerCount(expectedVal, 0x0000_0001_0000_0000L, maxTotal);
+        }
+
+        long tryIncrementWorkerCount(long expectedVal, long increment, int maxTotal) {
             for (; ; ) {
-                long witness = workerCountData.compareAndExchange(expectedVal, expectedVal + 0x0000_0001_0000_0000L);
+                long witness = workerCountData.compareAndExchange(expectedVal, expectedVal + increment);
                 // if the witnessed value matches the expected value the exchange succeeded -> return
                 // if the witnessed total count reached the maximum total -> give up
-                if (witness == expectedVal || getTotalCount(witness) == maxTotal) {
+                if (witness == expectedVal || getTotalCount(witness) >= maxTotal) {
                     return witness;
                 }
 
