@@ -12,6 +12,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
@@ -168,6 +169,7 @@ public class ThreadPool extends AbstractExecutorService {
     private final Condition joinCondVar = joinLock.newCondition();
     private final Condition terminationCondVar = joinLock.newCondition();
     private final WorkerCountData workerCountData = new WorkerCountData();
+    private final AtomicLong joinGeneration = new AtomicLong(0);
 
     private volatile boolean shutdown;
     private volatile boolean interrupt;
@@ -417,7 +419,7 @@ public class ThreadPool extends AbstractExecutorService {
         if (unit == null) {
             throw new NullPointerException();
         }
-        return doAwaitTermination(timeout, unit);
+        return handleAwait(timeout, unit, terminationCondVar, ThreadPool::isTerminated);
     }
 
     /**
@@ -429,7 +431,7 @@ public class ThreadPool extends AbstractExecutorService {
      * @throws InterruptedException if the current thread is interrupted while waiting
      */
     public void awaitTermination() throws InterruptedException {
-        doAwaitTermination(null, null);
+        handleAwait(null, null, terminationCondVar, ThreadPool::isTerminated);
     }
 
     /**
@@ -459,7 +461,7 @@ public class ThreadPool extends AbstractExecutorService {
         if (unit == null) {
             throw new NullPointerException();
         }
-        return doJoin(timeout, unit);
+        return handleAwait(timeout, unit, joinCondVar, ThreadPool::isIdle);
     }
 
     /**
@@ -482,7 +484,7 @@ public class ThreadPool extends AbstractExecutorService {
      * @throws InterruptedException if the current thread is interrupted while waiting
      */
     public void join() throws InterruptedException {
-        doJoin(null, null);
+        handleAwait(null, null, joinCondVar, ThreadPool::isIdle);
     }
 
     /**
@@ -675,48 +677,33 @@ public class ThreadPool extends AbstractExecutorService {
         return Runtime.getRuntime().availableProcessors();
     }
 
-    private boolean doAwaitTermination(Long timeout, TimeUnit unit) throws InterruptedException {
-        if (isTerminated()) {
+    private boolean handleAwait(Long timeout, TimeUnit unit, Condition condVar, Predicate<ThreadPool> awaitPredicate) throws InterruptedException {
+        if (awaitPredicate.test(this)) {
             return true;
         }
 
+        long currJoinGeneration = joinGeneration.get();
         joinLock.lock();
         try {
-            // re-check after acquiring lock
-            if (isTerminated()) {
-                return true;
-            }
-
+            boolean signalReceived;
             if (timeout != null && unit != null) {
-                return terminationCondVar.await(timeout, unit);
+                long nanosToWait = unit.toNanos(timeout);
+                while (currJoinGeneration == joinGeneration.get() && !awaitPredicate.test(this)) {
+                    if (nanosToWait <= 0L) {
+                        break;
+                    }
+                    nanosToWait = condVar.awaitNanos(nanosToWait);
+                }
+                signalReceived = nanosToWait > 0L;
             } else {
-                terminationCondVar.await();
-                return true;
-            }
-        } finally {
-            joinLock.unlock();
-        }
-    }
-
-    private boolean doJoin(Long timeout, TimeUnit unit) throws InterruptedException {
-        if (isIdle()) {
-            // no thread is currently doing any work
-            return true;
-        }
-
-        joinLock.lock();
-        try {
-            // re-check after acquiring lock
-            if (isIdle()) {
-                return true;
+                while (currJoinGeneration == joinGeneration.get() && !awaitPredicate.test(this)) {
+                    condVar.await();
+                }
+                signalReceived = true;
             }
 
-            if (timeout != null && unit != null) {
-                return joinCondVar.await(timeout, unit);
-            } else {
-                joinCondVar.await();
-                return true;
-            }
+            joinGeneration.compareAndSet(currJoinGeneration, currJoinGeneration + 1);
+            return signalReceived;
         } finally {
             joinLock.unlock();
         }
